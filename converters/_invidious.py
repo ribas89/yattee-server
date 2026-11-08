@@ -1,6 +1,8 @@
 """Invidious to model conversions."""
 
 import logging
+import re
+import urllib.parse
 from datetime import datetime
 from typing import Optional
 
@@ -72,7 +74,19 @@ def invidious_to_video_response(
             from routers.proxy import signed_relay_url
 
             absolute = resolve_invidious_url(invidious_url, invidious_base_url)
-            return signed_relay_url(base_url, absolute, content_type=content_type)
+            hostname = urllib.parse.urlsplit(absolute).hostname or ""
+            # Sign format identity for GoogleVideo sources, allowing the
+            # completed-media cache to find the same file on future requests.
+            cacheable = bool(
+                re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id)
+                and re.fullmatch(r"[0-9]{1,5}(?:-[A-Za-z0-9_]{1,32}){0,3}", itag or "")
+                and (hostname == "googlevideo.com" or hostname.endswith(".googlevideo.com"))
+            )
+            return signed_relay_url(
+                base_url, absolute, content_type=content_type,
+                video_id=video_id if cacheable else None,
+                itag=itag if cacheable else None,
+            )
         if effective_proxy_mode == "download" and base_url and itag:
             url = f"{base_url}/proxy/fast/{video_id}?itag={itag}"
             if stream_token:

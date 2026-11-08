@@ -23,6 +23,7 @@ import env_provisioning
 import feed_fetcher
 import invidious_proxy
 import pot_provider
+import video_cache
 from basic_auth import BasicAuthMiddleware
 from database.repositories.sites import get_enabled_sites
 from routers import admin, channels, comments, playlists, proxy, search, storyboards, subscriptions, videos
@@ -42,6 +43,9 @@ async def lifespan(app: FastAPI):
     cookie_health.start_task()
     # Startup: Clean up old download files then start periodic cleanup task
     proxy.cleanup_old_files_sync()
+    logger.info("[VideoCache] Settings: days=%d directory=%s enabled=%s",
+                config.VIDEO_CACHE_DAYS, config.VIDEO_CACHE_DIR, config.VIDEO_CACHE_DAYS > 0)
+    video_cache.cleanup_expired()
     proxy.start_cleanup_task()
     # Startup: Start feed fetcher for subscriptions
     feed_fetcher.start_feed_fetcher()

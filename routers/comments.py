@@ -1,5 +1,6 @@
 """Comments endpoints - InnerTube primary, Invidious fallback."""
 
+import asyncio
 import logging
 from typing import Any, List, Optional
 
@@ -7,10 +8,12 @@ from fastapi import APIRouter, HTTPException, Query
 
 import innertube
 import invidious_proxy
+import metadata_cache
 from converters import resolve_invidious_url
 
 router = APIRouter(tags=["comments"])
 logger = logging.getLogger(__name__)
+_refresh_jobs = {}
 
 
 def _resolve_comment_thumbnails(comments: List[Any], invidious_base: str) -> List[Any]:
@@ -52,12 +55,43 @@ async def get_comments(
     Responds 404 when the video owner turned comments off so clients can show a
     dedicated message instead of a generic error.
     """
+    cached = metadata_cache.get_comments(video_id, continuation)
+    if cached is not None:
+        logger.debug("[Comments] Cache hit for %s", video_id)
+        return cached
+
+    # Stale-while-revalidate: comments never block replay of a previously
+    # visited video. A failed refresh does not erase cached comments.
+    stale = metadata_cache.get_comments_stale(video_id, continuation)
+    if stale is not None:
+        key = (video_id, continuation)
+        task = _refresh_jobs.get(key)
+        if task is None or task.done():
+            async def refresh():
+                try:
+                    await _get_comments_live(video_id, continuation)
+                except Exception as exc:
+                    logger.info('[Comments] Background refresh failed for %s: %s', video_id, exc)
+                finally:
+                    _refresh_jobs.pop(key, None)
+            _refresh_jobs[key] = asyncio.create_task(refresh())
+        return stale
+
+    return await _get_comments_live(video_id, continuation)
+
+
+async def _get_comments_live(video_id: str, continuation: Optional[str]):
+    """Network-only fetch for first access or a background refresh."""
     # Try InnerTube first
+    empty_innertube = None
     try:
         data = await innertube.get_comments(video_id, continuation)
         if data and data.get("comments"):
             logger.info(f"[Comments] InnerTube success for {video_id}: {len(data['comments'])} comments")
+            metadata_cache.store_comments(video_id, continuation, data)
             return data
+        if data and isinstance(data.get("comments"), list):
+            empty_innertube = data
         logger.debug(f"[Comments] InnerTube returned no comments for {video_id}, trying Invidious")
     except innertube.CommentsDisabledError:
         raise HTTPException(status_code=404, detail="Comments are disabled")
@@ -76,6 +110,7 @@ async def get_comments(
                 invidious_base = invidious_proxy.get_base_url()
                 data["comments"] = _resolve_comment_thumbnails(data["comments"], invidious_base)
 
+            metadata_cache.store_comments(video_id, continuation, data)
             return data
         except invidious_proxy.InvidiousProxyError as e:
             if e.status_code == 404:
@@ -83,5 +118,9 @@ async def get_comments(
                 raise HTTPException(status_code=404, detail="Comments are disabled")
             raise HTTPException(status_code=502, detail=f"Comments proxy error: {e}")
 
-    # Neither source available — return empty rather than 503
+    # An authenticated InnerTube empty result is worth caching too.
+    if empty_innertube is not None:
+        metadata_cache.store_comments(video_id, continuation, empty_innertube)
+        return empty_innertube
+    # Neither source available — return empty rather than 503.
     return {"comments": [], "continuation": None}

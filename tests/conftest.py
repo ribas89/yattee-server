@@ -16,6 +16,14 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 
+@pytest.fixture(autouse=True)
+def isolated_video_cache(tmp_path, monkeypatch):
+    """Relay tests must not share persistent completed videos across cases."""
+    import config
+    monkeypatch.setattr(config, "VIDEO_CACHE_DIR", str(tmp_path / "video-cache"))
+    monkeypatch.setattr(config, "VIDEO_CACHE_DAYS", 30)
+
+
 # =============================================================================
 # Test Database Fixtures
 # =============================================================================

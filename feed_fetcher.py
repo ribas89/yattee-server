@@ -4,12 +4,14 @@ import asyncio
 import json
 import logging
 import sqlite3
-from datetime import datetime
+import time
+from datetime import UTC, datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
 
 import avatar_cache
+import config
 import database
 import innertube
 import invidious_proxy
@@ -21,6 +23,95 @@ from ytdlp_wrapper import YtDlpError, get_channel_info, is_valid_url, run_ytdlp
 logger = logging.getLogger(__name__)
 
 _fetch_task: Optional[asyncio.Task] = None
+
+# On-demand feed refresh. A second POST /feed may queue *due* channels,
+# but never overrides the persisted FEED_REFRESH_MINUTES freshness window.
+# Only one job per channel is active at a time, with bounded concurrency.
+_due_jobs: dict[tuple[str, str], asyncio.Task] = {}
+_due_last_attempt: dict[tuple[str, str], float] = {}
+_due_semaphore = asyncio.Semaphore(2)
+
+
+def schedule_due_refresh(channels: list[dict], *, skip_keys=None) -> int:
+    """Schedule only stale channels from this feed; return cached data immediately.
+
+    ``last_fetch`` comes from the persistent database, so restarts do not
+    change which channels are eligible. Already-running jobs are deduplicated.
+    ``skip_keys`` excludes channels whose initial fetch is pending.
+    """
+    interval = _feed_interval_seconds()
+    now = datetime.now(UTC)
+    wanted = {(c["channel_id"], c["site"]): c for c in channels}
+    skip = set(skip_keys or ())
+    watched = database.get_all_watched_channels()
+    due = []
+    fresh = 0
+    running = 0
+    cooldown = 0
+    for record in watched:
+        key = record["channel_id"], record["site"]
+        if key not in wanted or key in skip:
+            continue
+        existing = _due_jobs.get(key)
+        if existing is not None and not existing.done():
+            running += 1
+            continue
+        if _is_recent_feed(record.get("last_fetch"), interval, now):
+            fresh += 1
+            continue
+        # A failed upstream fetch must not cause another YouTube fetch on
+        # every client poll. Back off for up to five minutes before retrying.
+        if time.monotonic() - _due_last_attempt.get(key, -1e9) < min(interval, 300):
+            cooldown += 1
+            continue
+        due.append((key, wanted[key]))
+
+    for key, channel in due:
+        _due_last_attempt[key] = time.monotonic()
+        async def worker(item=channel, channel_key=key):
+            try:
+                async with _due_semaphore:
+                    # Recheck freshness *after* waiting in the queue: another
+                    # fetcher may have refreshed this channel in the meantime.
+                    current = next((ch for ch in database.get_all_watched_channels()
+                                    if (ch["channel_id"], ch["site"]) == channel_key), None)
+                    if current and _is_recent_feed(current.get("last_fetch"),
+                                                   _feed_interval_seconds(), datetime.now(UTC)):
+                        return
+                    await fetch_single_channel(item["channel_id"], item["site"], item.get("channel_url"))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[Feed] On-demand refresh failed for %s: %s", channel_key, exc)
+            finally:
+                _due_jobs.pop(channel_key, None)
+
+        _due_jobs[key] = asyncio.create_task(worker())
+
+    logger.info("[Feed] SECOND-REQUEST queued=%d fresh=%d already-running=%d cooldown=%d interval=%dmin",
+                len(due), fresh, running, cooldown, interval // 60)
+    return len(due)
+
+
+
+def _feed_interval_seconds() -> int:
+    if config.FEED_REFRESH_MINUTES is not None:
+        return config.FEED_REFRESH_MINUTES * 60
+    return get_settings().feed_fetch_interval
+
+
+def _is_recent_feed(last_fetch: Optional[str], interval: int, now: datetime) -> bool:
+    if not last_fetch:
+        return False
+    try:
+        previous = datetime.fromisoformat(str(last_fetch).replace("Z", "+00:00"))
+        if previous.tzinfo is None:
+            previous = previous.replace(tzinfo=UTC)
+        age_seconds = (now - previous).total_seconds()
+        return 0 <= age_seconds < interval
+    except (TypeError, ValueError, OverflowError):
+        return False
+
 
 _FEED_FETCH_ERRORS = (
     YtDlpError,
@@ -187,6 +278,7 @@ async def _fetch_channel_metadata_innertube(channel_id: str) -> Optional[Dict[st
             return {
                 "subscriber_count": channel_info.get("subCount"),
                 "is_verified": channel_info.get("authorVerified", False),
+                "avatar_thumbnails": channel_info.get("authorThumbnails") or [],
             }
     except innertube.InnerTubeError as e:
         logger.debug(f"[Feed] InnerTube channel metadata failed for {channel_id}: {e}")
@@ -253,6 +345,7 @@ async def _fetch_from_innertube(
             channel_metadata = {
                 "subscriber_count": channel_info.get("subCount"),
                 "is_verified": channel_info.get("authorVerified", False),
+                "avatar_thumbnails": channel_info.get("authorThumbnails") or [],
             }
 
         return all_videos, channel_metadata
@@ -280,6 +373,7 @@ async def _fetch_channel_metadata_invidious(channel_id: str) -> Optional[Dict[st
             return {
                 "subscriber_count": channel_info.get("subCount"),
                 "is_verified": channel_info.get("authorVerified", False),
+                "avatar_thumbnails": channel_info.get("authorThumbnails") or [],
             }
     except (KeyError, TypeError, ValueError) as e:
         logger.debug(f"Failed to fetch channel info for {channel_id}: {e}")
@@ -635,10 +729,6 @@ async def fetch_single_channel(channel_id: str, site: str, channel_url: str):
                     is_verified=channel_metadata.get("is_verified"),
                 )
 
-            # Schedule avatar caching for YouTube channels
-            if site.lower() == "youtube":
-                logger.debug(f"Scheduling avatar cache for {channel_id}")
-                avatar_cache.get_cache().schedule_background_fetch(channel_id)
 
             if pagination_info and pagination_info.get("pagination_limited"):
                 logger.warning(
@@ -657,7 +747,7 @@ async def fetch_single_channel(channel_id: str, site: str, channel_url: str):
         database.update_fetch_status(channel_id, site, success=False, error=error_msg)
 
 
-async def fetch_all_channels():
+async def fetch_all_channels(force: bool = False):
     """Fetch videos for all watched channels."""
     channels = database.get_all_watched_channels()
 
@@ -665,14 +755,23 @@ async def fetch_all_channels():
         logger.info("No channels to fetch")
         return
 
-    logger.info(f"Starting feed fetch for {len(channels)} watched channels")
+    interval = _feed_interval_seconds()
+    now = datetime.now(UTC)
+    due = channels if force else [ch for ch in channels if not _is_recent_feed(ch.get("last_fetch"), interval, now)]
+    skipped = len(channels) - len(due)
+    logger.info(
+        "[Feed] %d channels due, %d fresh/skipped (%d-minute interval)",
+        len(due), skipped, interval // 60,
+    )
+    if not due:
+        return
 
     success_count = 0
     error_count = 0
     limited_count = 0
     ytdlp_fallback_count = 0
 
-    for channel in channels:
+    for channel in due:
         channel_id = channel["channel_id"]
         site = channel["site"]
         channel_url = channel["channel_url"]
@@ -712,9 +811,6 @@ async def fetch_all_channels():
                         is_verified=channel_metadata.get("is_verified"),
                     )
 
-                # Schedule avatar caching for YouTube channels
-                if site.lower() == "youtube":
-                    avatar_cache.get_cache().schedule_background_fetch(channel_id)
 
                 # Track if yt-dlp fallback was used (had 414 before, no pagination_info now means fallback used)
                 s = get_settings()
@@ -777,6 +873,9 @@ async def fetch_all_channels():
 
 async def feed_fetch_loop():
     """Main loop for periodic feed fetching."""
+    if config.FEED_STARTUP_DELAY_SECONDS:
+        logger.info("[Feed] Delaying startup sweep by %d seconds", config.FEED_STARTUP_DELAY_SECONDS)
+        await asyncio.sleep(config.FEED_STARTUP_DELAY_SECONDS)
     while True:
         try:
             await fetch_all_channels()
@@ -795,8 +894,7 @@ async def feed_fetch_loop():
             logger.error(f"Feed fetch loop error: {e}", exc_info=True)
 
         # Wait for next fetch cycle
-        s = get_settings()
-        await asyncio.sleep(s.feed_fetch_interval)
+        await asyncio.sleep(_feed_interval_seconds())
 
 
 def start_feed_fetcher():
@@ -804,8 +902,7 @@ def start_feed_fetcher():
     global _fetch_task
     if _fetch_task is None or _fetch_task.done():
         _fetch_task = asyncio.create_task(feed_fetch_loop())
-        s = get_settings()
-        logger.info(f"Started feed fetcher (interval: {s.feed_fetch_interval}s)")
+        logger.info("Started feed fetcher (interval: %ds)", _feed_interval_seconds())
 
 
 def stop_feed_fetcher():

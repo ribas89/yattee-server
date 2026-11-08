@@ -19,6 +19,11 @@ router = APIRouter(tags=["subscriptions"])
 
 # Semaphore to limit concurrent feed fetches (DoS protection)
 _feed_fetch_semaphore = asyncio.Semaphore(10)
+# First complete feed load after server startup is cache-only. The second
+# load checks persisted freshness. Key by the exact channel set so pagination
+# and unrelated feeds do not consume the first-visit privilege.
+_seen_feed_groups: set[frozenset[tuple[str, str]]] = set()
+_initial_jobs: dict[tuple[str, str], asyncio.Task] = {}
 
 
 async def _rate_limited_fetch(channel_id: str, site: str, channel_url: str):
@@ -82,6 +87,7 @@ class StatelessFeedResponse(BaseModel):
     pending_count: Optional[int] = None
     error_count: Optional[int] = None
     eta_seconds: Optional[int] = None
+    refreshQueued: Optional[int] = None
 
 
 class ChannelStatusRequest(BaseModel):
@@ -153,14 +159,6 @@ async def post_feed(data: StatelessFeedRequest):
     # 1. Upsert all channels to watched_channels (updates last_requested)
     database.upsert_watched_channels(channels_dict)
 
-    # 1b. Schedule avatar caching for YouTube channels
-    cache = avatar_cache.get_cache()
-    youtube_channels = [ch for ch in data.channels if ch.site.lower() == "youtube"]
-    if youtube_channels:
-        logger.debug(f"Scheduling avatar cache for {len(youtube_channels)} YouTube channels")
-        for ch in youtube_channels:
-            cache.schedule_background_fetch(ch.channel_id)
-
     # 2. Check which channels have cached videos
     cached_channels = database.get_cached_channel_ids(channels_dict)
     all_channel_keys = {(ch.channel_id, ch.site) for ch in data.channels}
@@ -179,13 +177,34 @@ async def post_feed(data: StatelessFeedRequest):
         f"cached: {ready_count}, pending: {pending_count}, errored: {error_count}"
     )
 
-    # 3. Queue uncached channels for immediate fetch (skip errored ones)
+    # One ordinary first load is cache-only. The next load of the *same*
+    # channel set may queue a refresh, but only for channels whose persisted
+    # last_fetch is older than FEED_REFRESH_MINUTES. Pagination doesn't count
+    # as a second feed visit. No client-side refresh flag is needed.
+    refresh_queued = 0
+    if data.offset == 0:
+        group = frozenset(all_channel_keys)
+        if group in _seen_feed_groups:
+            refresh_queued = feed_fetcher.schedule_due_refresh(
+                channels_dict, skip_keys=uncached_channels
+            )
+        else:
+            if len(_seen_feed_groups) >= 128:
+                _seen_feed_groups.clear()
+            _seen_feed_groups.add(group)
+            logger.info("[Feed] FIRST-REQUEST cache-only (%d channels)", len(group))
+
+    # Brand-new uncached channels still need an initial background fetch.
     if uncached_channels:
-        logger.debug(f"Queueing {pending_count} uncached channels for fetch")
+        logger.debug("Queueing %d uncached channels for initial fetch", pending_count)
         for ch in data.channels:
             if (ch.channel_id, ch.site) in uncached_channels:
-                # Queue for immediate background fetch (rate-limited)
-                asyncio.create_task(_rate_limited_fetch(ch.channel_id, ch.site, ch.channel_url))
+                key = (ch.channel_id, ch.site)
+                if key not in _initial_jobs or _initial_jobs[key].done():
+                    task = asyncio.create_task(_rate_limited_fetch(ch.channel_id, ch.site, ch.channel_url))
+                    _initial_jobs[key] = task
+                    task.add_done_callback(lambda done, k=key: _initial_jobs.pop(k, None)
+                                           if _initial_jobs.get(k) is done else None)
 
     # 4. Get feed from cached channels only
     videos = database.get_feed_for_channels(channels_dict, limit=data.limit, offset=data.offset)
@@ -240,6 +259,7 @@ async def post_feed(data: StatelessFeedRequest):
         pending_count=pending_count,
         error_count=error_count,
         eta_seconds=eta_seconds,
+        refreshQueued=refresh_queued,
     )
 
 

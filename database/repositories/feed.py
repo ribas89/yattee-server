@@ -159,7 +159,7 @@ def update_fetch_status(
             )
             VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(channel_id, site) DO UPDATE SET
-                last_fetch = excluded.last_fetch,
+                last_fetch = COALESCE(excluded.last_fetch, feed_fetch_status.last_fetch),
                 fetch_error = excluded.fetch_error,
                 max_videos_fetched = excluded.max_videos_fetched,
                 pagination_limited = excluded.pagination_limited,
@@ -168,7 +168,7 @@ def update_fetch_status(
             (
                 channel_id,
                 site,
-                datetime.now(UTC).isoformat(),
+                datetime.now(UTC).isoformat() if success else None,
                 error if not success else None,
                 max_videos_fetched,
                 1 if pagination_limited else 0,
@@ -210,9 +210,12 @@ def get_all_watched_channels() -> List[Dict[str, Any]]:
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT channel_id, site, channel_name, channel_url, avatar_url, last_requested
-            FROM watched_channels
-            ORDER BY site, channel_id
+            SELECT w.channel_id, w.site, w.channel_name, w.channel_url,
+                   w.avatar_url, w.last_requested, f.last_fetch, f.fetch_error
+            FROM watched_channels AS w
+            LEFT JOIN feed_fetch_status AS f
+              ON f.channel_id = w.channel_id AND f.site = w.site
+            ORDER BY w.site, w.channel_id
         """)
         return [dict(row) for row in cursor.fetchall()]
 

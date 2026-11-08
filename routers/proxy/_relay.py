@@ -2,7 +2,7 @@
 
 Unlike ``/proxy/fast/{video_id}``, this endpoint takes the upstream URL
 itself (HMAC-signed by the server at extraction time) and streams it
-through to the client without yt-dlp re-extraction or on-disk caching.
+through to the client without mandatory yt-dlp re-extraction. Cached byte ranges can be replayed from disk.
 
 Why a separate endpoint:
 
@@ -31,16 +31,22 @@ import base64
 import hashlib
 import hmac
 import logging
+import base64 as _b64
+import binascii
+import json
+import random
 import re
 import time
 import urllib.parse
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import httpx
 from fastapi import HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
+import config
 import tokens as token_utils
+import video_cache
 from egress import is_youtube_url, local_address_for
 from routers.proxy._streaming import router
 from settings import get_settings
@@ -51,16 +57,82 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TTL_SECONDS = 6 * 60 * 60
 
-# Upstream chunk size for the binary stream-and-relay loop. googlevideo has
-# been observed to throttle / reset long-running single connections; reissuing
-# the upstream GET every CHUNK_SIZE bytes avoids that. Matches Invidious's
-# /videoplayback chunk size (10 MiB) — it's been battle-tested at that value.
-CHUNK_SIZE = 10 * 1024 * 1024
+# The upstream headers are non-sensitive headers supplied by yt-dlp's format.
+# They are embedded in the signed URL; cookies and authorization are excluded.
+_DOWNLOAD_HEADER_NAMES = {
+    "user-agent": "User-Agent",
+    "accept": "Accept",
+    "accept-language": "Accept-Language",
+    "referer": "Referer",
+    "origin": "Origin",
+    "sec-fetch-mode": "Sec-Fetch-Mode",
+}
+
+
+def _media_cache_type(url: str, claimed_type: str) -> str:
+    """Determine the real media MIME for signed GoogleVideo playback URLs.
+
+    GoogleVideo may report application/octet-stream for byte-range probes.
+    In that case its already-HMAC-verified `mime` URL parameter is the useful
+    media type. Do not trust arbitrary hosts or non-videoplayback paths.
+    """
+    normalized = claimed_type.split(";", 1)[0].strip().lower()
+    if normalized.startswith(("video/", "audio/")):
+        return normalized
+    if not is_youtube_url(url):
+        return normalized
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.path.endswith("/videoplayback"):
+        return normalized
+    embedded = urllib.parse.parse_qs(parsed.query).get("mime", [""])[0]
+    embedded = embedded.split(";", 1)[0].strip().lower()
+    if embedded.startswith(("video/", "audio/")):
+        return embedded
+    return normalized
+
+
+def _safe_download_headers(headers: Optional[dict]) -> dict[str, str]:
+    result = {}
+    for name, value in (headers or {}).items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            continue
+        canonical = _DOWNLOAD_HEADER_NAMES.get(name.lower())
+        if canonical and len(value) <= 400 and not any(c in value for c in "\r\n\x00"):
+            result[canonical] = value
+    return result
+
+
+def _encode_download_headers(headers: Optional[dict]) -> Optional[str]:
+    selected = _safe_download_headers(headers)
+    if not selected:
+        return None
+    payload = json.dumps(selected, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return _b64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+def _decode_download_headers(value: Optional[str]) -> dict[str, str]:
+    if not value:
+        return {}
+    if len(value) > 2000 or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError("Invalid signed upstream headers")
+    try:
+        payload = _b64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        parsed = json.loads(payload)
+    except (ValueError, UnicodeError, binascii.Error) as exc:
+        raise ValueError("Invalid signed upstream headers") from exc
+    if not isinstance(parsed, dict) or len(parsed) > len(_DOWNLOAD_HEADER_NAMES):
+        raise ValueError("Invalid signed upstream headers")
+    return _safe_download_headers(parsed)
+
+# Upstream video range size is configured through HTTP_CHUNK_SIZE.
+# Defaults to 1 MiB; recreate the container after changing its environment.
+CHUNK_SIZE = config.HTTP_CHUNK_SIZE
 
 # How many times we retry a single chunk before giving up. The retry uses the
 # byte offset we've already yielded to the client, so partial progress isn't
 # lost — we just resume the upstream Range from where we stopped.
-MAX_RETRIES_PER_CHUNK = 3
+MAX_RETRIES_PER_CHUNK = 6
+MIN_CHUNK_SIZE = 64 * 1024
 
 # Errors that justify a chunk retry. These are typically a TCP RST mid-read
 # (googlevideo recycling connections) or a ProtocolError from h2/keep-alive.
@@ -99,19 +171,27 @@ _PASSTHROUGH_RESPONSE_HEADERS = (
 )
 
 
-def _sign(url: str, exp: int) -> str:
+def _sign(url: str, exp: int, video_id: Optional[str] = None, itag: Optional[str] = None, rh: Optional[str] = None) -> str:
     """HMAC-SHA256 of ``url:exp`` keyed by the server's stream-token secret.
 
     Same key the existing token system uses (``tokens._get_signing_key``),
     so no new secret to provision.
     """
-    payload = f"{url}:{exp}".encode("utf-8")
+    payload_text = f"{url}:{exp}"
+    if video_id is not None and itag is not None:
+        payload_text += f":video={video_id}:itag={itag}"
+    if rh is not None:
+        payload_text += f":rh={rh}"
+    payload = payload_text.encode("utf-8")
     digest = hmac.new(token_utils._get_signing_key(), payload, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("utf-8")
 
 
-def _verify(url: str, exp: int, sig: str) -> bool:
-    expected = _sign(url, exp)
+def _verify(
+    url: str, exp: int, sig: str,
+    video_id: Optional[str] = None, itag: Optional[str] = None, rh: Optional[str] = None,
+) -> bool:
+    expected = _sign(url, exp, video_id, itag, rh)
     return hmac.compare_digest(expected, sig)
 
 
@@ -120,6 +200,9 @@ def signed_relay_url(
     upstream_url: str,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     content_type: Optional[str] = None,
+    video_id: Optional[str] = None,
+    itag: Optional[str] = None,
+    upstream_headers: Optional[dict] = None,
 ) -> str:
     """Mint a ``/proxy/relay?...`` URL the client can hit to play this stream.
 
@@ -127,11 +210,56 @@ def signed_relay_url(
     Without it the relay would be an open HTTP proxy.
     """
     exp = int(time.time()) + ttl_seconds
-    sig = _sign(upstream_url, exp)
+    # Bind refresh metadata to the existing HMAC. Ordinary signed URLs and
+    # manifest/segment links keep their original three-parameter format.
+    if (video_id is None) != (itag is None):
+        raise ValueError("video_id and itag must be supplied together")
+    rh = _encode_download_headers(upstream_headers)
+    sig = _sign(upstream_url, exp, video_id, itag, rh)
     params = {"url": upstream_url, "sig": sig, "exp": str(exp)}
+    if rh:
+        params["rh"] = rh
+    if video_id is not None:
+        params["video_id"] = video_id
+        params["itag"] = itag
     if content_type:
         params["ct"] = content_type
     return f"{base_url.rstrip('/')}/proxy/relay?{urllib.parse.urlencode(params)}"
+
+
+def signed_cached_url(base_url: str, video_id: str, itag: str, ttl_seconds: int = 86400) -> str:
+    """Mint an authenticated local-only URL for a fully cached format.
+
+    Unlike an old upstream URL, this works after YouTube media signatures expire.
+    """
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{11}", video_id) or not re.fullmatch(
+        r"[0-9]{1,5}(?:-[A-Za-z0-9_]{1,32}){0,3}", itag
+    ):
+        raise ValueError("Invalid cache key")
+    exp = int(time.time()) + ttl_seconds
+    key = f"cache://{video_id}/{itag}"
+    signature = _sign(key, exp)
+    path = f"/proxy/cached/{video_id}/{itag}"
+    return f"{base_url.rstrip('/')}{path}?{urllib.parse.urlencode({'exp': exp, 'sig': signature})}"
+
+
+@router.get("/cached/{video_id}/{itag}")
+async def serve_cached_media(video_id: str, itag: str, request: Request, exp: int, sig: str):
+    """Serve completed video bytes without any dependency on YouTube metadata."""
+    try:
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{11}", video_id) or not re.fullmatch(
+            r"[0-9]{1,5}(?:-[A-Za-z0-9_]{1,32}){0,3}", itag
+        ):
+            raise HTTPException(status_code=403, detail="Invalid cache key")
+        if time.time() > exp or not _verify(f"cache://{video_id}/{itag}", exp, sig):
+            raise HTTPException(status_code=403, detail="Invalid cache token")
+        cached = video_cache.lookup(video_id, itag)
+        if cached is None:
+            raise HTTPException(status_code=404, detail="Completed video not cached")
+        logger.info("[VideoCache] HIT-LOCAL %s:%s", video_id, itag)
+        return video_cache.cached_response(cached, request.headers.get("range"))
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Invalid cache token") from exc
 
 
 # --- HLS manifest rewriting -------------------------------------------------
@@ -226,6 +354,7 @@ async def _stream_chunked_with_retry(
     base_headers: dict,
     start: int,
     end_inclusive: Optional[int],
+    refresh_url: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
 ):
     """Stream bytes ``start..end_inclusive`` (HTTP-style inclusive end) from
     upstream, breaking the read into ``CHUNK_SIZE``-sized upstream GETs.
@@ -240,14 +369,20 @@ async def _stream_chunked_with_retry(
     non-success status.
     """
     cursor = start
+    active_chunk_size = CHUNK_SIZE
+    refreshes_remaining = 3
 
     while end_inclusive is None or cursor <= end_inclusive:
-        chunk_end = cursor + CHUNK_SIZE - 1
+        # Match yt-dlp's HTTP downloader: vary each chunk between 95% and
+        # 100% of the configured maximum, rather than fixed MiB boundaries.
+        request_size = random.randint(max(1, int(active_chunk_size * 0.95)), active_chunk_size)
+        chunk_end = cursor + request_size - 1
         if end_inclusive is not None:
             chunk_end = min(chunk_end, end_inclusive)
 
         chunk_yielded = 0
         last_error: Optional[BaseException] = None
+        refreshed_this_chunk = False
 
         for attempt in range(MAX_RETRIES_PER_CHUNK):
             attempt_start = cursor + chunk_yielded
@@ -272,12 +407,45 @@ async def _stream_chunked_with_retry(
                 await resp.aclose()
                 return
 
+            if (resp.status_code == 403 and refresh_url is not None
+                    and refreshes_remaining > 0 and not refreshed_this_chunk):
+                # Retry with the same media format and unchanged byte offset.
+                await resp.aclose()
+                refreshed_this_chunk = True
+                refreshes_remaining -= 1
+                try:
+                    replacement = await refresh_url(url)
+                except Exception as exc:
+                    logger.warning("[Relay] Could not refresh upstream media URL: %s", type(exc).__name__)
+                    replacement = None
+                if replacement and replacement != url:
+                    logger.warning("[Relay] Re-extracted media URL after 403 at offset %d", attempt_start)
+                    url = replacement
+                    continue
+                # Refresh failed; fall through to the smaller-range retry.
+                # Keep the original status available without sending an
+                # unnecessary duplicate request.
+
+            if resp.status_code == 403 and chunk_end - attempt_start + 1 > MIN_CHUNK_SIZE:
+                # Reduce range length when upstream rejects the request.
+                previous_size = chunk_end - attempt_start + 1
+                active_chunk_size = max(MIN_CHUNK_SIZE, previous_size // 2)
+                chunk_end = attempt_start + active_chunk_size - 1
+                if end_inclusive is not None:
+                    chunk_end = min(chunk_end, end_inclusive)
+                await resp.aclose()
+                logger.warning(
+                    "[Relay] 403 for %d-byte range; retrying with %d bytes at offset %d",
+                    previous_size, chunk_end - attempt_start + 1, attempt_start,
+                )
+                continue
+
             if resp.status_code >= 400:
-                # Authoritative error from upstream, surface to client.
-                body = await resp.aread()
+                # Do not log the original media URL (it contains signed tokens).
+                status = resp.status_code
                 await resp.aclose()
                 raise httpx.HTTPStatusError(
-                    f"upstream {resp.status_code} for bytes={attempt_start}-{chunk_end}: {body[:200]!r}",
+                    f"upstream {status} for bytes={attempt_start}-{chunk_end}",
                     request=resp.request,
                     response=resp,
                 )
@@ -306,8 +474,14 @@ async def _stream_chunked_with_retry(
             # Exhausted retries.
             raise last_error if last_error else RuntimeError("relay chunk failed")
 
-        # Defensive: if upstream returned no body, don't loop forever.
+        # A zero-byte successful response is not EOF when we KNOW that the
+        # downstream client expects more bytes; fail visibly instead of
+        # completing a truncated Content-Length response.
         if chunk_yielded == 0:
+            if end_inclusive is not None:
+                raise RuntimeError(
+                    f"upstream returned an empty body for bytes={cursor}-{chunk_end}"
+                )
             return
 
         chunk_request_size = chunk_end - cursor + 1
@@ -318,10 +492,17 @@ async def _stream_chunked_with_retry(
         if single_shot:
             return
 
-        # If we asked for N bytes and got fewer, upstream is signalling EOF —
-        # stop even if end_inclusive was beyond the real content end.
+        # Some upstreams return a smaller 206 range than we requested. That
+        # is NOT EOF while the downstream response still has known remaining
+        # bytes. Request the next chunk from the exact offset received, so
+        # no bytes are repeated or skipped.
         if chunk_yielded < chunk_request_size:
-            return
+            if end_inclusive is None or cursor > end_inclusive:
+                return
+            logger.warning(
+                "[Relay] short upstream range (%d/%d bytes); continuing at byte %d",
+                chunk_yielded, chunk_request_size, cursor,
+            )
 
 
 # --- Endpoint ---------------------------------------------------------------
@@ -334,18 +515,45 @@ async def relay(
     sig: str,
     exp: int,
     ct: Optional[str] = None,
+    video_id: Optional[str] = None,
+    itag: Optional[str] = None,
+    rh: Optional[str] = None,
 ):
     if int(time.time()) > exp:
         raise HTTPException(status_code=403, detail="Relay URL expired")
 
-    if not _verify(url, exp, sig):
+    if (video_id is None) != (itag is None):
+        raise HTTPException(status_code=403, detail="Invalid refresh metadata")
+    if video_id is not None:
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{11}", video_id) or not (itag and len(itag) <= 64 and re.fullmatch(r"[0-9]{1,5}(?:-[A-Za-z0-9_]{1,32}){0,3}", itag)):
+            raise HTTPException(status_code=403, detail="Invalid refresh metadata")
+    if not _verify(url, exp, sig, video_id, itag, rh):
         raise HTTPException(status_code=403, detail="Invalid relay signature")
+    try:
+        signed_headers = _decode_download_headers(rh)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Invalid upstream headers") from exc
 
     # SSRF guard. The signature already prevents arbitrary URLs from
     # reaching here, but if the converter ever produced a URL pointing at
     # an internal service we still want to refuse.
     if not is_safe_url(url):
         raise HTTPException(status_code=403, detail="URL targets restricted network resources")
+
+    # A completed format is keyed by (video_id, itag), independent of the
+    # ephemeral upstream signature. Check BEFORE contacting YouTube.
+    if video_id is not None and itag is not None and is_youtube_url(url):
+        cached = video_cache.lookup(video_id, itag)
+        if cached is not None:
+            logger.info("[VideoCache] HIT %s:%s", video_id, itag)
+            return video_cache.cached_response(cached, request.headers.get("range"))
+        # Intermittent seeking need not fetch bytes we have already saved.
+        partial_response = video_cache.cached_partial_response(
+            video_id, itag, request.headers.get("range"),
+        )
+        if partial_response is not None:
+            logger.info("[VideoCache] PARTIAL-HIT %s:%s", video_id, itag)
+            return partial_response
 
     upstream_headers = {
         "User-Agent": UPSTREAM_USER_AGENT,
@@ -355,6 +563,7 @@ async def relay(
         # not re-compressible anyway, and avoiding it sidesteps a class of
         # passthrough bugs.
         "Accept-Encoding": "identity",
+        **signed_headers,
     }
     # Forward client conditionals; the client's Range is parsed/applied
     # below per-chunk, so don't pass it raw to the meta probe.
@@ -387,6 +596,9 @@ async def relay(
         **({"transport": transport} if transport else {}),
     )
 
+    # URL refresh is limited to signed yt-dlp-derived YouTube streams.
+    refresh_enabled = bool(video_id and itag and is_youtube_url(url))
+
     # --- Meta probe: tiny first request to discover total/status/type ----
     # We use Range: bytes=0-0 to get just the first byte (1 B body) so we
     # can read Content-Range/total without downloading anything significant.
@@ -401,8 +613,20 @@ async def relay(
         logger.warning(f"[Relay] Upstream connect failed for {url[:120]}: {e}")
         raise HTTPException(status_code=502, detail=f"Upstream connect failed: {e}") from e
 
+    if meta.status_code >= 400:
+        status = meta.status_code
+        await meta.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"Upstream metadata request returned {status}")
+
     upstream_content_type = meta.headers.get("content-type", "")
-    response_content_type = (ct or upstream_content_type or "").split(";")[0].strip().lower()
+    response_content_type = _media_cache_type(url, ct or upstream_content_type or "")
+    # If GoogleVideo's metadata probe was generic, correct the response MIME
+    # using the signed URL so downstream clients and the cache agree.
+    inferred_media_type = (
+        response_content_type.startswith(("video/", "audio/"))
+        and not (ct or upstream_content_type or "").split(";", 1)[0].strip().lower().startswith(("video/", "audio/"))
+    )
     is_hls = response_content_type in HLS_CONTENT_TYPES or url.split("?", 1)[0].endswith(".m3u8")
     is_dash = response_content_type in DASH_CONTENT_TYPES or url.split("?", 1)[0].endswith(".mpd")
 
@@ -446,8 +670,64 @@ async def relay(
             except ValueError:
                 pass
 
-    # Decide what to send back to the client. If it asked for a Range and
-    # we know the total, return 206 + Content-Range; otherwise 200 + length.
+    async def refresh_media_url(previous_url: str) -> Optional[str]:
+        # Never switch formats or change file size mid-play.
+        from ytdlp_wrapper._youtube import get_video_info
+
+        info = await get_video_info(video_id, use_cache=False)
+        format_match = next(
+            (fmt for fmt in info.get("formats", [])
+             if str(fmt.get("format_id")) == itag and fmt.get("url")),
+            None,
+        )
+        if not format_match:
+            return None
+        candidate = format_match["url"]
+        replacement_headers = {**upstream_headers, **_safe_download_headers(format_match.get("http_headers"))}
+        if candidate == previous_url or not is_youtube_url(candidate) or not is_safe_url(candidate):
+            return None
+        old_size = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("clen", [None])[0]
+        new_size = urllib.parse.parse_qs(urllib.parse.urlsplit(candidate).query).get("clen", [None])[0]
+        if old_size and new_size and old_size != new_size:
+            logger.warning("[Relay] Refusing refreshed URL: media byte length changed")
+            return None
+        try:
+            probe = await client.get(
+                candidate, headers={**replacement_headers, "Range": "bytes=0-0"}
+            )
+        except httpx.RequestError:
+            return None
+        if probe.status_code != 206:
+            return None
+        candidate_total = _parse_content_range_total(probe.headers.get("content-range"))
+        if total is not None and candidate_total != total:
+            logger.warning("[Relay] Refusing refreshed URL: Content-Range total changed")
+            return None
+        upstream_headers.update(replacement_headers)
+        return candidate
+
+    # Validate seek ranges before writing any HTTP response headers.
+    # Clients can send open-ended and suffix ranges while fast-forwarding.
+    if client_range and total is not None:
+        raw_range = client_range.strip()
+        suffix = re.fullmatch(r"bytes=-(\d+)", raw_range)
+        standard = re.fullmatch(r"bytes=(\d+)-(\d*)", raw_range)
+        if suffix and int(suffix.group(1)) > 0:
+            range_start = max(0, total - int(suffix.group(1)))
+            range_end = total - 1
+        elif standard:
+            range_start = int(standard.group(1))
+            range_end = int(standard.group(2)) if standard.group(2) else None
+        else:
+            await meta.aclose()
+            await client.aclose()
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
+        if range_start >= total or (range_end is not None and range_end < range_start):
+            await meta.aclose()
+            await client.aclose()
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
+
+    # Return standard range metadata to the player.
     if client_range and total is not None:
         loop_end = range_end if range_end is not None else (total - 1)
         # Clamp range_end to content end if client asked for more than exists.
@@ -480,26 +760,189 @@ async def relay(
             response_headers[h] = v
     if ct:
         response_headers["content-type"] = ct
+    if inferred_media_type:
+        response_headers["content-type"] = response_content_type
 
     await meta.aclose()
 
-    async def body_iter():
+    if video_id and itag and is_youtube_url(url):
+        if config.VIDEO_CACHE_DAYS == 0:
+            logger.info("[VideoCache] BYPASS %s:%s reason=disabled", video_id, itag)
+        elif total is None or total <= 0:
+            logger.info("[VideoCache] BYPASS %s:%s reason=unknown-size status=%s", video_id, itag, meta.status_code)
+        elif meta.status_code != 206:
+            logger.info("[VideoCache] BYPASS %s:%s reason=upstream-status-%d", video_id, itag, meta.status_code)
+        elif not response_content_type.startswith(("video/", "audio/")):
+            logger.info("[VideoCache] BYPASS %s:%s reason=non-media-type mime=%s", video_id, itag, response_content_type)
+        else:
+            logger.info("[VideoCache] LOOKUP/MISS %s:%s requested=%s-%s size=%d mime=%s",
+                        video_id, itag, range_start, loop_end, total, response_content_type)
+
+    # Sparse replay: stitch verified cached spans with precisely the missing
+    # byte ranges. No sparse-file holes are ever sent to the client, and each
+    # successfully fetched missing span is persisted even if playback stops.
+    partial = None
+    segments = None
+    if (video_id is not None and itag is not None and is_youtube_url(url)
+            and total is not None and meta.status_code == 206
+            and response_content_type.startswith(("video/", "audio/"))):
+        partial = video_cache.lookup_partial(video_id, itag, expected_size=total)
+        if partial is not None:
+            segments = video_cache.split_ranges(partial, range_start, loop_end + 1)
+
+    if segments is not None and any(cached for cached, _, _ in segments):
+        cached_bytes = sum(hi - lo for cached, lo, hi in segments if cached)
+        missing_bytes = sum(hi - lo for cached, lo, hi in segments if not cached)
+        logger.info("[VideoCache] PARTIAL %s:%s cached=%d upstream-needed=%d requested=%s-%s",
+                    video_id, itag, cached_bytes, missing_bytes, range_start, loop_end)
+        async def sparse_body():
+            for is_cached, lo, hi in segments:
+                if is_cached:
+                    for piece in video_cache.read_cached_chunks(partial, lo, hi):
+                        yield piece
+                else:
+                    writer = video_cache.begin(
+                        video_id, itag, total, response_content_type, lo,
+                    )
+                    missing_iter = _stream_chunked_with_retry(
+                        client=client, url=url, base_headers=upstream_headers,
+                        start=lo, end_inclusive=hi - 1,
+                        refresh_url=refresh_media_url if refresh_enabled else None,
+                    )
+                    try:
+                        async for piece in missing_iter:
+                            if writer is not None:
+                                try:
+                                    writer.write(piece)
+                                except (OSError, ValueError) as exc:
+                                    logger.warning("[VideoCache] Partial write failed: %s", exc)
+                                    writer.close()
+                                    writer = None
+                            yield piece
+                    finally:
+                        if writer is not None:
+                            writer.close()
+                        await missing_iter.aclose()
+
+        upstream_iter = sparse_body()
+        prebuffer = bytearray()
+        initial_target = min(CHUNK_SIZE, loop_end - range_start + 1)
         try:
-            async for piece in _stream_chunked_with_retry(
-                client=client,
-                url=url,
-                base_headers=upstream_headers,
-                start=range_start,
-                end_inclusive=loop_end,
-            ):
+            while len(prebuffer) < initial_target:
+                piece = await anext(upstream_iter, None)
+                if piece is None:
+                    break
+                prebuffer.extend(piece)
+        except (httpx.HTTPStatusError, *RETRYABLE_UPSTREAM_ERRORS, RuntimeError, OSError) as e:
+            logger.warning("[Relay] sparse playback failed before streaming began: %s", e)
+            await upstream_iter.aclose()
+            await client.aclose()
+            raise HTTPException(status_code=502, detail="Upstream media request failed") from e
+        if len(prebuffer) < initial_target:
+            await upstream_iter.aclose()
+            await client.aclose()
+            raise HTTPException(status_code=502, detail="Upstream returned incomplete initial video range")
+
+        async def sparse_response_body():
+            try:
+                if prebuffer:
+                    yield bytes(prebuffer)
+                async for piece in upstream_iter:
+                    yield piece
+            finally:
+                await upstream_iter.aclose()
+                await client.aclose()
+
+        response_headers["X-Yattee-Video-Cache"] = "PARTIAL" if any(not c for c, _, _ in segments) else "PARTIAL-HIT"
+        return StreamingResponse(
+            sparse_response_body(), status_code=response_status,
+            headers=response_headers,
+        )
+
+    # Prime the first upstream response BEFORE sending 200/206 + a fixed
+    # Content-Length to the player. If YouTube rejects the first real range,
+    # the client gets a genuine 502 instead of an empty 206 response that
+    # Uvicorn later reports as "shorter than Content-Length".
+    upstream_iter = _stream_chunked_with_retry(
+        client=client,
+        url=url,
+        base_headers=upstream_headers,
+        start=range_start,
+        end_inclusive=loop_end,
+        refresh_url=refresh_media_url if refresh_enabled else None,
+    )
+    # Fully prebuffer the first range before committing Content-Length.
+    # A failing seek now returns 502 (so the player can retry), rather than
+    # a misleading successful 206 followed by an ASGI protocol exception.
+    prebuffer = bytearray()
+    initial_target = min(CHUNK_SIZE, loop_end - range_start + 1) if loop_end is not None else CHUNK_SIZE
+    try:
+        while len(prebuffer) < initial_target:
+            piece = await anext(upstream_iter, None)
+            if piece is None:
+                break
+            prebuffer.extend(piece)
+    except (httpx.HTTPStatusError, *RETRYABLE_UPSTREAM_ERRORS, RuntimeError) as e:
+        logger.warning("[Relay] upstream failed before streaming began: %s", e)
+        await upstream_iter.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="Upstream media request failed") from e
+
+    if len(prebuffer) < initial_target:
+        await upstream_iter.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="Upstream returned incomplete initial video range")
+
+    # Record byte ranges as the client receives them. Only a fully covered,
+    # size-validated media file is published for later playback. The writer
+    # survives seeks by merging ranges from successive relay requests.
+    cache_writer = None
+    if (video_id is not None and itag is not None and is_youtube_url(url)
+            and total is not None and meta.status_code == 206
+            and response_content_type.startswith(("video/", "audio/"))):
+        try:
+            cache_writer = video_cache.begin(
+                video_id, itag, total, response_content_type, range_start
+            )
+        except OSError as exc:
+            logger.warning("[VideoCache] Unable to open media cache: %s", exc)
+
+    async def body_iter():
+        nonlocal cache_writer
+        try:
+            if prebuffer:
+                payload = bytes(prebuffer)
+                if cache_writer is not None:
+                    try:
+                        cache_writer.write(payload)
+                    except (OSError, ValueError) as exc:
+                        logger.warning("[VideoCache] Cache write failed, playback continues: %s", exc)
+                        cache_writer.close()
+                        cache_writer = None
+                yield payload
+            async for piece in upstream_iter:
+                if cache_writer is not None:
+                    try:
+                        cache_writer.write(piece)
+                    except (OSError, ValueError) as exc:
+                        logger.warning("[VideoCache] Cache write failed, playback continues: %s", exc)
+                        cache_writer.close()
+                        cache_writer = None
                 yield piece
-        except httpx.HTTPStatusError as e:
-            logger.warning(f"[Relay] upstream error mid-stream: {e}")
-        except RETRYABLE_UPSTREAM_ERRORS as e:
-            logger.warning(f"[Relay] gave up mid-stream after retries: {e}")
+        except Exception as e:
+            # Once response headers have been sent, we cannot replace 206
+            # with an error response. Don't silently swallow an upstream
+            # failure and make a truncated response look successful.
+            logger.warning("[Relay] upstream stream ended with an error: %s", e)
+            raise
         finally:
+            if cache_writer is not None:
+                cache_writer.close()
+            await upstream_iter.aclose()
             await client.aclose()
 
+    if cache_writer is not None:
+        response_headers["X-Yattee-Video-Cache"] = "MISS"
     return StreamingResponse(
         body_iter(),
         status_code=response_status,

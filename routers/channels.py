@@ -91,6 +91,9 @@ async def get_channel(channel_id: str):
         try:
             data = await innertube.get_channel_info(channel_id)
             if data:
+                avatar_cache.get_cache().store_from_channel_info(
+                    data.get("authorId") or channel_id, data.get("authorThumbnails") or []
+                )
                 thumbnails = [
                     Thumbnail(quality="default", url=t["url"], width=t.get("width"), height=t.get("height"))
                     for t in data.get("authorThumbnails", [])
@@ -136,6 +139,10 @@ async def get_channel(channel_id: str):
                         )
                         for banner in data.get("authorBanners", [])
                     ]
+                    avatar_cache.get_cache().store_from_channel_info(
+                        data.get("authorId") or channel_id,
+                        [dict(url=t.url, width=t.width, height=t.height) for t in thumbnails],
+                    )
                     return ChannelResponse(
                         authorId=data.get("authorId", channel_id),
                         author=data.get("author", ""),
@@ -224,8 +231,11 @@ async def get_channel_videos_endpoint(
     # For Invidious proxy, pass continuation token directly
     page = int(continuation) if continuation and continuation.isdigit() else 1
 
-    # For YouTube channels, try InnerTube first, then Invidious, then yt-dlp
+    # Opening the channel videos tab can refresh a stale/missing avatar once.
+    # Normal feed/video listings and restarts NEVER trigger avatar refreshes.
     if _is_youtube_channel_id(channel_id):
+        if not continuation:
+            avatar_cache.get_cache().schedule_background_fetch(channel_id)
         # Try InnerTube first
         try:
             data = await innertube.get_channel_videos(channel_id, continuation)
@@ -324,58 +334,17 @@ async def get_channel_avatar_image(channel_id: str, size: int):
             logger.warning(f"[Avatar Endpoint] Failed to fetch stored avatar for {channel_id}: {e}")
             raise HTTPException(status_code=404, detail="Avatar not found")
 
-    # YouTube channel - use avatar cache
-    cache = avatar_cache.get_cache()
-
-    # Try cache first
-    thumbnails = await cache.get(channel_id)
-    logger.info(f"[Avatar Endpoint] Cache check for {channel_id}: {'HIT' if thumbnails else 'MISS'}")
-
-    # Not in cache - fetch now
-    if not thumbnails:
-        logger.info(f"[Avatar Endpoint] Fetching avatar for {channel_id}")
-        thumbnails = await cache.fetch_and_cache(channel_id)
-        logger.info(f"[Avatar Endpoint] Fetch result for {channel_id}: {'SUCCESS' if thumbnails else 'FAILED'}")
-
-    if not thumbnails:
-        logger.error(f"[Avatar Endpoint] No thumbnails available for {channel_id}")
-        raise HTTPException(status_code=404, detail=f"Avatar not found for channel {channel_id}")
-
-    # Find the best matching size
-    best_thumb = None
-    best_diff = float("inf")
-
-    for thumb in thumbnails:
-        thumb_size = thumb.get("width") or thumb.get("height") or 0
-        diff = abs(thumb_size - size)
-        if diff < best_diff:
-            best_diff = diff
-            best_thumb = thumb
-
-    if not best_thumb or not best_thumb.get("url"):
-        raise HTTPException(status_code=404, detail=f"Avatar URL not found for channel {channel_id}")
-
-    # Fetch and proxy the image
-    image_url = best_thumb["url"]
-    # Fix protocol-relative URLs
-    if image_url.startswith("//"):
-        image_url = "https:" + image_url
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(image_url)
-            response.raise_for_status()
-
-            content_type = response.headers.get("content-type", "image/jpeg")
-            return Response(
-                content=response.content,
-                media_type=content_type,
-                headers={
-                    "Cache-Control": "public, max-age=86400"  # Cache for 24h
-                },
-            )
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch avatar image: {e}")
+    # Never fetch from YouTube here: subscription lists can request hundreds
+    # of avatars. Images are saved on disk when the corresponding channel opens.
+    cached = avatar_cache.get_cache().get_cached_image(channel_id)
+    if cached is None:
+        raise HTTPException(status_code=404, detail="Avatar not cached; open channel to populate")
+    content, media_type = cached
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @router.get("/channels/{channel_id}/playlists", response_model=ChannelPlaylistsResponse)

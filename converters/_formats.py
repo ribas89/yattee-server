@@ -1,6 +1,7 @@
 """MIME types, cookies, stream format conversion, and thumbnails."""
 
 import urllib.parse
+import re
 from typing import Dict, List, Optional
 
 import tokens as token_utils
@@ -245,7 +246,24 @@ def convert_formats(
         if proxy_mode == "relay" and proxy_base_url and base_url:
             from routers.proxy import signed_relay_url
 
-            url = signed_relay_url(base_url, direct_url)
+            # Bind the source video/format to signed media URLs so the relay
+            # can obtain a fresh URL if a WARP IP-bound URL starts returning 403.
+            hostname = urllib.parse.urlsplit(direct_url).hostname or ""
+            can_refresh = bool(
+                re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id)
+                # yt-dlp adds suffixes to some audio format IDs, e.g.
+                # 140-drc, 140-0 or 140-0-drc. The previous numeric-only
+                # check prevented those audio streams from refreshing on 403.
+                and len(itag) <= 64
+                and re.fullmatch(r"[0-9]{1,5}(?:-[A-Za-z0-9_]{1,32}){0,3}", itag)
+                and (hostname == "googlevideo.com" or hostname.endswith(".googlevideo.com"))
+            )
+            url = signed_relay_url(
+                base_url, direct_url,
+                video_id=video_id if can_refresh else None,
+                itag=itag if can_refresh else None,
+                upstream_headers=http_headers,
+            )
         elif proxy_mode == "download" and proxy_base_url and video_id:
             if original_url:
                 encoded_url = urllib.parse.quote(original_url, safe="")

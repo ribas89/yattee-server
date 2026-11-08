@@ -7,9 +7,12 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 
 import avatar_cache
+import config
 import database
 import innertube
 import invidious_proxy
+import metadata_cache
+import video_info_cache
 from basic_auth import get_current_user_from_request
 from converters import (
     invidious_to_video_list_item,
@@ -20,6 +23,7 @@ from converters import (
 from innertube import InnerTubeError
 from models import ChannelExtractResponse, Thumbnail, VideoResponse
 from settings import get_settings
+from stream_preference import add_combined_candidate, prefer_combined_streams
 from utils import get_base_url
 from ytdlp_wrapper import (
     YtDlpError,
@@ -34,6 +38,7 @@ from ytdlp_wrapper import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["videos"])
+
 
 
 def validate_extractor_allowed(extractor: str):
@@ -66,13 +71,14 @@ async def get_video(
         None,
         description=(
             "How to proxy stream URLs when proxying is on. "
-            "'relay' (default): byte-relay through /proxy/relay (fast, supports Range, no disk write). "
+            "'relay' (default): byte-relay with sparse on-disk caching and HTTP Range support. "
             "'download': /proxy/fast/ — downloads via yt-dlp, caches on disk (right shape for downloads). "
             "'off': bypass proxying entirely. "
             "Ignored when the per-site proxy_streaming flag (or ?proxy=) is off."
         ),
         pattern="^(relay|download|off)$",
     ),
+    refresh: bool = Query(False, description="Refresh metadata in background; cached playback is never blocked"),
     invidious: Optional[bool] = Query(
         None,
         description=(
@@ -167,10 +173,7 @@ async def get_video(
             user_id=user_id,
         )
         response.extractionMethod = "invidious"
-        channel_id = data.get("authorId")
-        if channel_id:
-            avatar_cache.get_cache().schedule_background_fetch(channel_id)
-        return response
+        return prefer_combined_streams(metadata_cache.apply_description(video_id, response))
 
     async def _via_hybrid() -> VideoResponse:
         response = await _get_video_hybrid(
@@ -179,7 +182,57 @@ async def get_video(
         )
         if response is None:
             raise HTTPException(status_code=404, detail="Video not found")
-        return response
+        return prefer_combined_streams(metadata_cache.apply_description(video_id, response))
+
+    # Cached playback is our fastest path: the serialized video info can be
+    # returned without InnerTube /next, yt-dlp or YouTube's recommendation API.
+    # Cache only canonical signed-relay mode; never mix proxy-off and download
+    # response shapes, nor force-Invidious test requests with default clients.
+    cache_allowed = (proxy_streams and effective_proxy_mode == "relay"
+                     and invidious is not True)
+
+    async def _refresh_cached_info():
+        """Refresh noncritical video metadata without delaying playback."""
+        try:
+            latest = await (_via_invidious() if invidious_usable and invidious is not False
+                            else _via_hybrid())
+            if cache_allowed:
+                video_info_cache.store(video_id, latest)
+        except Exception as exc:
+            logger.warning("[Videos] Background metadata refresh failed for %s: %s", video_id, exc)
+
+    if cache_allowed:
+        from_cache = video_info_cache.load(video_id, base_url)
+        if from_cache is not None:
+            if refresh or video_info_cache.due(video_id):
+                video_info_cache.schedule(video_id, _refresh_cached_info)
+            return from_cache
+
+        # On a first visit, don't hold the video formats hostage to a separate
+        # /next fetch (or the optional supplemental TV storyboard request).
+        # yt-dlp supplies both the progressive playback URL and basic details.
+        # /next enrichment runs as a *separate* task, after the response.
+        try:
+            info = await get_video_info(video_id)
+            first = ytdlp_to_video_response(info, base_url, proxy_streams=proxy_streams,
+                                            proxy_mode=effective_proxy_mode, user_id=user_id)
+            first.extractionMethod = "ytdlp"
+            first = prefer_combined_streams(metadata_cache.apply_description(video_id, first))
+            if not first.liveNow and not first.isUpcoming:
+                video_info_cache.store(video_id, first)
+
+                async def _enrich_noncritical():
+                    if not innertube.is_enabled():
+                        return
+                    data = await innertube.get_video_player_next(video_id)
+                    _enrich_with_innertube_next(first, data)
+                    video_info_cache.store(video_id, first)
+
+                video_info_cache.schedule(video_id, _enrich_noncritical)
+            logger.info("[Videos] Playback-first response for %s (recommendations deferred)", video_id)
+            return first
+        except (YtDlpError, ValueError, KeyError, TypeError) as exc:
+            logger.info("[Videos] Fast extraction unavailable for %s: %s; falling back", video_id, exc)
 
     # invidious=true: force Invidious, no fallback
     if invidious is True:
@@ -271,8 +324,6 @@ async def _get_video_hybrid(
         )
         response.extractionMethod = "ytdlp"
         channel_id = info.get("channel_id")
-        if channel_id:
-            avatar_cache.get_cache().schedule_background_fetch(channel_id)
         if s.invidious_author_thumbnails and channel_id and not response.authorThumbnails:
             thumbnails = await invidious_proxy.get_channel_thumbnails(channel_id)
             if thumbnails:
@@ -300,9 +351,6 @@ async def _get_video_hybrid(
         )
         _enrich_with_innertube_next(response, it_video)
         response.extractionMethod = "hybrid"
-        channel_id = info.get("channel_id") or it_video.get("authorId")
-        if channel_id:
-            avatar_cache.get_cache().schedule_background_fetch(channel_id)
         return response
 
     merged = {**it_video, "formatStreams": format_streams, "adaptiveFormats": adaptive_formats}
@@ -312,9 +360,16 @@ async def _get_video_hybrid(
     )
     response.extractionMethod = "hybrid"
 
+    # The InnerTube shape join can omit progressive itag 18 even when yt-dlp
+    # extracted it. Recover it from the *same* yt-dlp info; no extra request.
+    if config.PREFER_COMBINED_STREAMS and not response.liveNow:
+        extracted_response = ytdlp_to_video_response(
+            info, base_url, proxy_streams=proxy_streams,
+            proxy_mode=proxy_mode, user_id=user_id,
+        )
+        add_combined_candidate(response, extracted_response)
+
     channel_id = it_video.get("authorId") or info.get("channel_id")
-    if channel_id:
-        avatar_cache.get_cache().schedule_background_fetch(channel_id)
 
     # Fall back to Invidious/scrape for author thumbnails only if still missing
     if s.invidious_author_thumbnails and channel_id and not response.authorThumbnails:
@@ -421,7 +476,7 @@ async def extract_video_url(
             info, base_url, proxy_streams=proxy_streams, proxy_mode=ext_proxy_mode,
             original_url=url, user_id=user_id,
         )
-        return response
+        return prefer_combined_streams(response)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except YtDlpError as e:

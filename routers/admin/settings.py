@@ -255,17 +255,7 @@ async def refresh_all_watched_channels(admin: dict = Depends(get_current_admin))
 
     logger = logging.getLogger(__name__)
 
-    # Schedule avatar caching for all YouTube watched channels
-    cache = avatar_cache.get_cache()
-    channels = database.get_all_watched_channels()
-    youtube_channels = [ch for ch in channels if ch.get("site", "").lower() == "youtube" and ch.get("channel_id")]
-
-    if youtube_channels:
-        logger.debug(f"Scheduling avatar cache refresh for {len(youtube_channels)} YouTube watched channels")
-        for ch in youtube_channels:
-            cache.schedule_background_fetch(ch["channel_id"])
-
     # Trigger background fetch (non-blocking)
-    asyncio.create_task(fetch_all_channels())
+    asyncio.create_task(fetch_all_channels(force=True))
 
     return {"success": True, "message": "Refresh started for all channels"}

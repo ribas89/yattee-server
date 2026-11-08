@@ -16,7 +16,12 @@ Set these in your `.env` file or as system/Docker environment variables.
 | `HOST` | string | `0.0.0.0` | Server bind address |
 | `PORT` | integer | `8080` | Server port. Docker default is `8085`. |
 | `DATA_DIR` | string | `data` | Directory for database, encryption keys, and temp files |
+| `VIDEO_DESCRIPTION_CACHE_DIR` | path | `${DATA_DIR}/cache/video_descriptions` | Persistent descriptions; no expiry. Never caches stream URLs. |
+| `COMMENTS_CACHE_DIR` | path | `${DATA_DIR}/cache/comments` | Persistent comments by video ID and continuation token. |
+| `COMMENTS_CACHE_MINUTES` | integer | `360` | Comment freshness period in minutes (0 disables, max 10080). |
 | `DOWNLOAD_DIR` | string | *(empty)* | Directory for proxied video downloads. If empty, uses a default location. |
+| `HTTP_CHUNK_SIZE` | integer (bytes) | `1048576` (1 MiB) | Upstream HTTP range size for `/proxy/relay` video playback. Range: 65536–10485760 bytes. Applied on container creation (recreate after changing `.env`). |
+| `PREFER_COMBINED_STREAMS` | boolean | `true` | Prefer progressive video+audio (itag 18 at 360p). When available, suppress adaptive video-only tracks but retain audio-only choices. Set `false` for separate DASH streams and higher-resolution adaptive playback. No extra YouTube requests. |
 | `CREDENTIALS_ENCRYPTION_KEY` | string | *(auto-generated)* | Fernet encryption key for site credentials. Auto-generated on first run if not set. Generate with: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
 | `CORS_ORIGINS` | string | *(empty)* | Comma-separated list of allowed origins (e.g., `https://app.example.com,https://admin.example.com`) |
 | `CORS_ALLOW_ALL` | boolean | `false` | Allow all origins. Credentials are **disabled** in this mode. For development only. |
@@ -129,3 +134,12 @@ All cache TTL values are in seconds.
 |---------|------|---------|-------|-------------|
 | `proxy_download_max_age` | integer | `86400` | 60 - 604800 | Maximum age for cached download files in seconds |
 | `proxy_max_concurrent_downloads` | integer | `3` | 1 - 20 | Maximum concurrent proxy downloads |
+
+
+## Feed refresh after restart
+
+- `FEED_REFRESH_MINUTES=360` (optional): Only refresh a channel when its last successful fetch is at least this many minutes old. Range: 5–10080. If unset, uses the saved admin setting `feed_fetch_interval` (seconds).
+- `FEED_STARTUP_DELAY_SECONDS=300`: Delay the first freshness check on application startup; this does not force a fetch.
+
+The existing `/data/yattee.db` persists `feed_fetch_status.last_fetch` as an
+ISO 8601 timestamp in UTC. No new table or migration is necessary.
